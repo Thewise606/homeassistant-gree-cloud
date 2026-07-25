@@ -19,5 +19,22 @@
     "abort": {
       "already_configured": "This account is already configured"
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Gree Cloud Discovery Settings",
+        "description": "Tune how devices are discovered/bound. Useful for large fleets (many devices/branches on one Gree+ account) to avoid overwhelming Gree's servers.",
+        "data": {
+          "batch_size": "Batch size (devices per batch)",
+          "concurrency_limit": "Max concurrent connections (discovery)",
+          "poll_concurrency_limit": "Max concurrent connections (ongoing polling)",
+          "batch_delay": "Delay between batches (seconds)",
+          "retry_attempts": "Retry attempts per device",
+          "retry_delay": "Delay between retries (seconds)",
+          "device_timeout": "Per-device timeout (seconds)"
+        }
+      }
+    }
   }
 }
