@@ -27,6 +27,7 @@ _RECONNECT_MODULE = __name__.rsplit(".", 1)[0]  # custom_components.gree_cloud
 
 from .const import (
     CONF_SERVER,
+    DEFAULT_POLL_CONCURRENCY_LIMIT,
     DISPATCH_DEVICE_DISCOVERED,
     DOMAIN,
     HWHP_PROP_POW_CONSUMP,
@@ -135,11 +136,19 @@ class GreeCloudRuntimeData:
     mqtt_client: GreeMqttClient
     coordinators: list[CloudDeviceDataUpdateCoordinator]
     mqtt_reconnect_lock: asyncio.Lock = None
+    # Shared across every device's coordinator so that, once the integration
+    # is fully loaded and each device is polling on its own independent
+    # 60s timer, only a bounded number of status polls / commands are ever
+    # in flight to Gree's cloud at once — even on a fleet of 100+ devices
+    # whose timers happen to line up.
+    poll_semaphore: asyncio.Semaphore = None
 
     def __post_init__(self) -> None:
         """Initialise fields that need a running event loop."""
         if self.mqtt_reconnect_lock is None:
             self.mqtt_reconnect_lock = asyncio.Lock()
+        if self.poll_semaphore is None:
+            self.poll_semaphore = asyncio.Semaphore(DEFAULT_POLL_CONCURRENCY_LIMIT)
 
 
 class CloudDeviceDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -154,16 +163,27 @@ class CloudDeviceDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         device: CloudDevice,
     ) -> None:
         """Initialize the cloud data update coordinator."""
+        # Deterministic per-device jitter (0-20s) added to the base update
+        # interval. On a large fleet, many coordinators otherwise end up on
+        # nearly the same 60s heartbeat (they were all created within a
+        # short discovery window), causing periodic polling to burst
+        # together the same way initial discovery would without batching.
+        try:
+            jitter = int(device.device_info.mac, 16) % 20 if device.device_info.mac else 0
+        except ValueError:
+            jitter = 0
+
         super().__init__(
             hass,
             _LOGGER,
             config_entry=config_entry,
             name=f"{DOMAIN}-{device.device_info.name}",
-            update_interval=timedelta(seconds=UPDATE_INTERVAL),
+            update_interval=timedelta(seconds=UPDATE_INTERVAL + jitter),
             always_update=False,
         )
         self.device = device
         self._error_count: int = 0
+        self._poll_semaphore = config_entry.runtime_data.poll_semaphore
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Update the state of the device from cloud."""
@@ -173,7 +193,10 @@ class CloudDeviceDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._error_count,
         )
         try:
-            await self.device.update_state()
+            # Bounded so a large fleet's independently-timed polls can't all
+            # hit Gree's cloud/MQTT broker at once.
+            async with self._poll_semaphore:
+                await self.device.update_state()
             self._error_count = 0
             return copy.deepcopy(self.device.raw_properties)
 
@@ -249,7 +272,18 @@ class CloudDeviceDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
 
 class CloudDiscoveryService:
-    """Cloud discovery service for Gree devices."""
+    """Cloud discovery service for Gree devices.
+
+    Designed for fleets ranging from a handful of devices up to several
+    hundred (e.g. many branches under one Gree+ account):
+      - Devices are processed in configurable batches, with a pause between
+        batches to avoid hammering Gree's MQTT/cloud servers.
+      - A semaphore bounds how many devices are actively being bound/
+        refreshed at once, regardless of batch size.
+      - Each device gets its own retry loop with a delay between attempts.
+      - One device failing (even after retries) never stops the others —
+        exceptions are always contained per-device.
+    """
 
     def __init__(
         self, hass: HomeAssistant, entry: GreeCloudConfigEntry, api: GreeCloudApi
@@ -259,69 +293,189 @@ class CloudDiscoveryService:
         self.entry = entry
         self.api = api
 
+    def _option(self, key: str, default: Any) -> Any:
+        return self.entry.options.get(key, default)
+
     async def discover_devices(
         self, mqtt_client: GreeMqttClient
     ) -> list[CloudDeviceDataUpdateCoordinator]:
-        """Discover all cloud devices."""
-        coordinators = []
+        """Discover, bind and do the first refresh for every cloud device."""
+        from .const import (
+            CONF_BATCH_DELAY,
+            CONF_BATCH_SIZE,
+            CONF_CONCURRENCY_LIMIT,
+            CONF_DEVICE_TIMEOUT,
+            CONF_RETRY_ATTEMPTS,
+            CONF_RETRY_DELAY,
+            DEFAULT_BATCH_DELAY,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_CONCURRENCY_LIMIT,
+            DEFAULT_DEVICE_TIMEOUT,
+            DEFAULT_RETRY_ATTEMPTS,
+            DEFAULT_RETRY_DELAY,
+        )
+
+        batch_size = self._option(CONF_BATCH_SIZE, DEFAULT_BATCH_SIZE)
+        concurrency_limit = self._option(CONF_CONCURRENCY_LIMIT, DEFAULT_CONCURRENCY_LIMIT)
+        batch_delay = self._option(CONF_BATCH_DELAY, DEFAULT_BATCH_DELAY)
+        retry_attempts = self._option(CONF_RETRY_ATTEMPTS, DEFAULT_RETRY_ATTEMPTS)
+        retry_delay = self._option(CONF_RETRY_DELAY, DEFAULT_RETRY_DELAY)
+        device_timeout = self._option(CONF_DEVICE_TIMEOUT, DEFAULT_DEVICE_TIMEOUT)
+
+        coordinators: list[CloudDeviceDataUpdateCoordinator] = []
 
         try:
-            # Get all devices from cloud
-            _LOGGER.debug("Fetching devices from Gree Cloud")
+            _LOGGER.debug("Fetching device list from Gree Cloud")
             cloud_devices = await self.api.get_all_devices()
+        except Exception:
+            _LOGGER.exception("Failed to fetch device list from Gree Cloud")
+            return coordinators
 
-            _LOGGER.info("Found %d cloud devices", len(cloud_devices))
+        total = len(cloud_devices)
+        _LOGGER.info(
+            "Gree Cloud: found %d device(s). Discovering in batches of %d "
+            "(max %d concurrent, %d retr%s per device, %.1fs between batches)",
+            total,
+            batch_size,
+            concurrency_limit,
+            retry_attempts,
+            "y" if retry_attempts == 1 else "ies",
+            batch_delay,
+        )
 
-            # Create coordinator for each device
-            for cloud_dev_info in cloud_devices:
-                try:
-                    # Create DeviceInfo for CloudDevice
-                    device_info = DeviceInfo(
-                        ip="0.0.0.0",  # Not used for cloud devices
-                        port=0,  # Not used for cloud devices
-                        mac=cloud_dev_info.mac,
-                        name=cloud_dev_info.name,
+        semaphore = asyncio.Semaphore(max(1, concurrency_limit))
+        stats = {"bound": 0, "failed": 0, "retried": 0}
+
+        async def setup_one(
+            cloud_dev_info: CloudDeviceInfo, position: int
+        ) -> CloudDeviceDataUpdateCoordinator | None:
+            """Bind one device and get its first state, with retries."""
+            async with semaphore:
+                last_err: Exception | None = None
+                for attempt in range(1, max(1, retry_attempts) + 1):
+                    try:
+                        device_info = DeviceInfo(
+                            ip="0.0.0.0",  # Not used for cloud devices
+                            port=0,  # Not used for cloud devices
+                            mac=cloud_dev_info.mac,
+                            name=cloud_dev_info.name,
+                        )
+                        device = HWHPAwareCloudDevice(
+                            mqtt_client=mqtt_client,
+                            device_info=device_info,
+                            device_key=cloud_dev_info.key,
+                            cipher_version=1,
+                        )
+
+                        await asyncio.wait_for(device.bind(), timeout=device_timeout)
+
+                        coordinator = CloudDeviceDataUpdateCoordinator(
+                            self.hass, self.entry, device
+                        )
+                        # NOTE: we deliberately use async_refresh(), not
+                        # async_config_entry_first_refresh(). The latter is
+                        # only valid while the config entry is still in
+                        # SETUP_IN_PROGRESS state, but discovery now runs as
+                        # a background task *after* setup has already
+                        # finished (entry state LOADED) so devices can come
+                        # online progressively without blocking bootstrap.
+                        # async_refresh() does the same "first update" work
+                        # without that restriction.
+                        await asyncio.wait_for(
+                            coordinator.async_refresh(),
+                            timeout=device_timeout,
+                        )
+
+                        stats["bound"] += 1
+                        _LOGGER.debug(
+                            "[%d/%d] Bound cloud device: %s (MAC: %s)%s",
+                            position,
+                            total,
+                            cloud_dev_info.name,
+                            cloud_dev_info.mac,
+                            f" (attempt {attempt})" if attempt > 1 else "",
+                        )
+
+                        async_dispatcher_send(
+                            self.hass, DISPATCH_DEVICE_DISCOVERED, coordinator
+                        )
+                        return coordinator
+
+                    except Exception as err:  # noqa: BLE001 - contained per device
+                        last_err = err
+                        if attempt < retry_attempts:
+                            stats["retried"] += 1
+                            _LOGGER.debug(
+                                "[%d/%d] Attempt %d/%d failed for %s (MAC: %s): "
+                                "%s — retrying in %.1fs",
+                                position,
+                                total,
+                                attempt,
+                                retry_attempts,
+                                cloud_dev_info.name,
+                                cloud_dev_info.mac,
+                                err,
+                                retry_delay,
+                            )
+                            await asyncio.sleep(retry_delay)
+                            continue
+
+                stats["failed"] += 1
+                _LOGGER.warning(
+                    "[%d/%d] Giving up on device %s (MAC: %s) after %d "
+                    "attempt(s): %s",
+                    position,
+                    total,
+                    cloud_dev_info.name,
+                    cloud_dev_info.mac,
+                    retry_attempts,
+                    last_err,
+                )
+                return None
+
+        for batch_start in range(0, total, max(1, batch_size)):
+            batch = cloud_devices[batch_start : batch_start + batch_size]
+            batch_num = batch_start // batch_size + 1
+            total_batches = (total + batch_size - 1) // batch_size
+            _LOGGER.info(
+                "Gree Cloud: processing batch %d/%d (devices %d-%d of %d)",
+                batch_num,
+                total_batches,
+                batch_start + 1,
+                batch_start + len(batch),
+                total,
+            )
+
+            results = await asyncio.gather(
+                *(
+                    setup_one(dev, batch_start + i + 1)
+                    for i, dev in enumerate(batch)
+                ),
+                return_exceptions=True,
+            )
+
+            for dev, result in zip(batch, results):
+                if isinstance(result, Exception):
+                    stats["failed"] += 1
+                    _LOGGER.error(
+                        "Unexpected error setting up device %s (MAC: %s): %s",
+                        dev.name,
+                        dev.mac,
+                        result,
                     )
+                elif result is not None:
+                    coordinators.append(result)
 
-                    # Create cloud device instance
-                    device = HWHPAwareCloudDevice(
-                        mqtt_client=mqtt_client,
-                        device_info=device_info,
-                        device_key=cloud_dev_info.key,
-                        cipher_version=1,  # Default to v1, can be made configurable
-                    )
+            if batch_start + batch_size < total and batch_delay:
+                await asyncio.sleep(batch_delay)
 
-                    # Bind to cloud device (subscribe to MQTT topics)
-                    await device.bind()
-
-                    _LOGGER.debug(
-                        "Bound to cloud device: %s (MAC: %s)",
-                        device.device_info.name,
-                        device.device_info.mac,
-                    )
-
-                    # Create coordinator
-                    coordinator = CloudDeviceDataUpdateCoordinator(
-                        self.hass, self.entry, device
-                    )
-                    coordinators.append(coordinator)
-
-                    # Initial refresh
-                    await coordinator.async_config_entry_first_refresh()
-
-                    # Notify about discovered device
-                    async_dispatcher_send(
-                        self.hass, DISPATCH_DEVICE_DISCOVERED, coordinator
-                    )
-
-                except Exception as err:
-                    _LOGGER.exception(
-                        "Failed to setup cloud device %s: %s",
-                        cloud_dev_info.name,
-                        err,
-                    )
-
-        except Exception as err:
-            _LOGGER.exception("Failed to discover cloud devices: %s", err)
+        _LOGGER.info(
+            "Gree Cloud: discovery complete — %d bound, %d failed, %d retried "
+            "(out of %d total device(s))",
+            stats["bound"],
+            stats["failed"],
+            stats["retried"],
+            total,
+        )
 
         return coordinators
