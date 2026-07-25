@@ -15,6 +15,40 @@ DISCOVERY_TIMEOUT = 10
 MAX_ERRORS = 3
 MAX_EXPECTED_RESPONSE_TIME_INTERVAL = 180
 
+# --- Large-fleet discovery options (configurable via Options flow) ---
+# How many devices are processed in one batch before pausing.
+CONF_BATCH_SIZE = "batch_size"
+DEFAULT_BATCH_SIZE = 10
+
+# Max number of devices being bound/refreshed at the same time, across the
+# whole discovery run (bounded by an asyncio.Semaphore).
+CONF_CONCURRENCY_LIMIT = "concurrency_limit"
+DEFAULT_CONCURRENCY_LIMIT = 5
+
+# Max number of *ongoing* status polls / commands in flight at once, once
+# the integration is fully loaded and devices are polling every
+# UPDATE_INTERVAL seconds on their own independent timers. Without this,
+# a large fleet's periodic polls can still burst together even though
+# discovery itself was paced.
+CONF_POLL_CONCURRENCY_LIMIT = "poll_concurrency_limit"
+DEFAULT_POLL_CONCURRENCY_LIMIT = 10
+
+# Pause between batches, to spread out load on the Gree MQTT/cloud servers.
+CONF_BATCH_DELAY = "batch_delay"
+DEFAULT_BATCH_DELAY = 2.0
+
+# Retries per device before giving up on it for this discovery run.
+CONF_RETRY_ATTEMPTS = "retry_attempts"
+DEFAULT_RETRY_ATTEMPTS = 3
+
+# Delay between retries for the same device.
+CONF_RETRY_DELAY = "retry_delay"
+DEFAULT_RETRY_DELAY = 5.0
+
+# Max seconds to wait for a single device's bind() or first refresh.
+CONF_DEVICE_TIMEOUT = "device_timeout"
+DEFAULT_DEVICE_TIMEOUT = 45
+
 # Dispatcher signals
 DISPATCH_DEVICE_DISCOVERED = f"{DOMAIN}_device_discovered"
 
@@ -63,7 +97,7 @@ GREE_MQTT_SERVERS = {
     "India": "mqtt-in.gree.com",
     "Latin American": "mqtt-la.gree.com",
     "Middle East": "mqtt-me.gree.com",
-    "North American": "mqtt-us.gree.com",
+    "North American": "mqtt-na.gree.com",
     "Russia": "mqtt-ru.gree.com",
     "South American": "mqtt-sa.gree.com",
 }
