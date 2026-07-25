@@ -9,9 +9,28 @@ import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
+from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 
-from .const import CONF_SERVER, DOMAIN, GREE_CLOUD_SERVERS
+from .const import (
+    CONF_BATCH_DELAY,
+    CONF_BATCH_SIZE,
+    CONF_CONCURRENCY_LIMIT,
+    CONF_DEVICE_TIMEOUT,
+    CONF_POLL_CONCURRENCY_LIMIT,
+    CONF_RETRY_ATTEMPTS,
+    CONF_RETRY_DELAY,
+    CONF_SERVER,
+    DEFAULT_BATCH_DELAY,
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_CONCURRENCY_LIMIT,
+    DEFAULT_DEVICE_TIMEOUT,
+    DEFAULT_POLL_CONCURRENCY_LIMIT,
+    DEFAULT_RETRY_ATTEMPTS,
+    DEFAULT_RETRY_DELAY,
+    DOMAIN,
+    GREE_CLOUD_SERVERS,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,3 +97,68 @@ class GreeCloudConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data_schema=data_schema,
             errors=errors,
         )
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> GreeCloudOptionsFlow:
+        """Get the options flow for this handler."""
+        return GreeCloudOptionsFlow()
+
+
+class GreeCloudOptionsFlow(config_entries.OptionsFlow):
+    """Options flow for tuning large-fleet discovery behaviour.
+
+    Useful when a single Gree+ account has many devices (dozens to hundreds,
+    e.g. spread across many branches): lets you control how many devices are
+    bound at once, how much the discovery pauses between batches to ease
+    load on Gree's MQTT/cloud servers, and how retries are handled.
+    """
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Manage the options."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        current = self.config_entry.options
+        data_schema = vol.Schema(
+            {
+                vol.Required(
+                    CONF_BATCH_SIZE,
+                    default=current.get(CONF_BATCH_SIZE, DEFAULT_BATCH_SIZE),
+                ): vol.All(vol.Coerce(int), vol.Range(min=1, max=100)),
+                vol.Required(
+                    CONF_CONCURRENCY_LIMIT,
+                    default=current.get(
+                        CONF_CONCURRENCY_LIMIT, DEFAULT_CONCURRENCY_LIMIT
+                    ),
+                ): vol.All(vol.Coerce(int), vol.Range(min=1, max=50)),
+                vol.Required(
+                    CONF_POLL_CONCURRENCY_LIMIT,
+                    default=current.get(
+                        CONF_POLL_CONCURRENCY_LIMIT, DEFAULT_POLL_CONCURRENCY_LIMIT
+                    ),
+                ): vol.All(vol.Coerce(int), vol.Range(min=1, max=50)),
+                vol.Required(
+                    CONF_BATCH_DELAY,
+                    default=current.get(CONF_BATCH_DELAY, DEFAULT_BATCH_DELAY),
+                ): vol.All(vol.Coerce(float), vol.Range(min=0, max=120)),
+                vol.Required(
+                    CONF_RETRY_ATTEMPTS,
+                    default=current.get(CONF_RETRY_ATTEMPTS, DEFAULT_RETRY_ATTEMPTS),
+                ): vol.All(vol.Coerce(int), vol.Range(min=1, max=10)),
+                vol.Required(
+                    CONF_RETRY_DELAY,
+                    default=current.get(CONF_RETRY_DELAY, DEFAULT_RETRY_DELAY),
+                ): vol.All(vol.Coerce(float), vol.Range(min=0, max=120)),
+                vol.Required(
+                    CONF_DEVICE_TIMEOUT,
+                    default=current.get(CONF_DEVICE_TIMEOUT, DEFAULT_DEVICE_TIMEOUT),
+                ): vol.All(vol.Coerce(int), vol.Range(min=5, max=300)),
+            }
+        )
+
+        return self.async_show_form(step_id="init", data_schema=data_schema)
